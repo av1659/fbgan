@@ -107,10 +107,46 @@ class WGAN_LangGP():
         gradients = autograd.grad(outputs=disc_interpolates, inputs=interpolates,
                                   grad_outputs=torch.ones(disc_interpolates.size()).cuda() \
                                   if self.use_cuda else torch.ones(disc_interpolates.size()),
-                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
+                                  create_graph=True, retain_graph=True)[0]
 
-        gradient_penalty = ((gradients.norm(2, dim=1).norm(2,dim=1) - 1) ** 2).mean() * self.lamda
-        return gradient_penalty
+        gradients = gradients.contiguous().view(self.batch_size, -1)
+        gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+
+        #gradient_penalty = ((gradients.norm(2, dim=1).norm(2,dim=1) - 1) ** 2).mean() * self.lamda
+        return self.lamda * ((gradients_norm - 1) ** 2).mean()
+
+    def disc_train_iteration(self, real_data):
+        self.D_optimizer.zero_grad()
+
+        fake_data = self.sample_generator(self.batch_size)
+        d_fake_pred = self.D(fake_data)
+        d_fake_err = d_fake_pred.mean()
+        d_real_pred = self.D(real_data)
+        d_real_err = d_real_pred.mean()
+
+        gradient_penalty = self.calc_gradient_penalty(real_data, fake_data)
+
+        d_err = d_fake_err - d_real_err + gradient_penalty
+        d_err.backward()
+        self.D_optimizer.step()
+
+        return d_fake_err.data, d_real_err.data, gradient_penalty.data
+
+    def sample_generator(self, num_sample):
+        z_input = Variable(torch.randn(num_sample, 128))
+        if self.use_cuda: z_input = z_input.cuda()
+        generated_data = self.G(z_input)
+        return generated_data
+
+    def gen_train_iteration(self):
+        self.G.zero_grad()
+        z_input = to_var(torch.randn(self.batch_size, 128))
+        g_fake_data = self.G(z_input)
+        dg_fake_pred = self.D(g_fake_data)
+        g_err = -torch.mean(dg_fake_pred)
+        g_err.backward()
+        self.G_optimizer.step()
+        return g_err
 
     def train_model(self, load_dir):
         init_epoch = self.load_model(load_dir)
@@ -119,15 +155,11 @@ class WGAN_LangGP():
         d_fake_losses, d_real_losses, grad_penalties = [],[],[]
         G_losses, D_losses, W_dist = [],[],[]
 
-        one = torch.FloatTensor([1])
-        one = one.cuda() if self.use_cuda else one
-        one_neg = one * -1
-
         table = np.arange(len(self.charmap)).reshape(-1, 1)
         one_hot = OneHotEncoder()
         one_hot.fit(table)
 
-        i = 0
+        counter = 0
         for epoch in range(self.n_epochs):
             n_batches = int(len(self.data)/self.batch_size)
             for idx in range(n_batches):
@@ -138,50 +170,26 @@ class WGAN_LangGP():
                 data_one_hot = one_hot.transform(_data.reshape(-1, 1)).toarray().reshape(self.batch_size, -1, len(self.charmap))
                 real_data = torch.Tensor(data_one_hot)
                 real_data = to_var(real_data)
-                for p in self.D.parameters():  # reset requires_grad
-                    p.requires_grad = True  # they are set to False below in netG update
-                for _ in range(self.d_steps):
-                    self.D.zero_grad()
-                    d_real_pred = self.D(real_data)
-                    d_real_err = torch.mean(d_real_pred) #want to push d_real as high as possible
-                    d_real_err.backward(one_neg)
 
-                    z_input = to_var(torch.randn(self.batch_size, 128))
-                    d_fake_data = self.G(z_input).detach()
-                    d_fake_pred = self.D(d_fake_data)
-                    d_fake_err = torch.mean(d_fake_pred) #want to push d_fake as low as possible
-                    d_fake_err.backward(one)
-
-                    gradient_penalty = self.calc_gradient_penalty(real_data.data, d_fake_data.data)
-                    gradient_penalty.backward()
-
-                    d_err = d_fake_err - d_real_err + gradient_penalty
-                    self.D_optimizer.step()
+                d_fake_err, d_real_err, gradient_penalty = self.disc_train_iteration(real_data)
 
                 # Append things for logging
-                d_fake_np, d_real_np, gp_np = (d_fake_err.data).cpu().numpy(), \
-                        (d_real_err.data).cpu().numpy(), (gradient_penalty.data).cpu().numpy()
+                d_fake_np, d_real_np, gp_np = d_fake_err.cpu().numpy(), \
+                        d_real_err.cpu().numpy(), gradient_penalty.cpu().numpy()
                 grad_penalties.append(gp_np)
                 d_real_losses.append(d_real_np)
                 d_fake_losses.append(d_fake_np)
                 D_losses.append(d_fake_np - d_real_np + gp_np)
                 W_dist.append(d_real_np - d_fake_np)
-                # Train G
-                for p in self.D.parameters():
-                    p.requires_grad = False  # to avoid computation
 
-                self.G.zero_grad()
-                z_input = to_var(torch.randn(self.batch_size, 128))
-                g_fake_data = self.G(z_input)
-                dg_fake_pred = self.D(g_fake_data)
-                g_err = -torch.mean(dg_fake_pred)
-                g_err.backward()
-                self.G_optimizer.step()
-                G_losses.append((g_err.data).cpu().numpy())
-                if i % 100 == 99:
+                if counter % self.d_steps == 0:
+                    g_err = self.gen_train_iteration()
+                    G_losses.append((g_err.data).cpu().numpy())
+
+                if counter % 100 == 99:
                     self.save_model(i)
                     self.sample(i)
-                if i % 10 == 9:
+                if counter % 10 == 9:
                     summary_str = 'Iteration [{}/{}] - loss_d: {}, loss_g: {}, w_dist: {}, grad_penalty: {}'\
                         .format(i, total_iterations, (d_err.data).cpu().numpy(),
                         (g_err.data).cpu().numpy(), ((d_real_err - d_fake_err).data).cpu().numpy(), gp_np)
@@ -191,7 +199,7 @@ class WGAN_LangGP():
                     plot_losses([W_dist], ["w_dist"], self.sample_dir + "dist.png")
                     plot_losses([grad_penalties],["grad_penalties"], self.sample_dir + "grad.png")
                     plot_losses([d_fake_losses, d_real_losses],["d_fake", "d_real"], self.sample_dir + "d_loss_components.png")
-                i += 1
+                counter += 1
             np.random.shuffle(self.data)
 
     def sample(self, epoch):
