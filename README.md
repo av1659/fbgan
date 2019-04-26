@@ -3,9 +3,6 @@
 ## System Requirements and Installation
 ```pip install -r requirements.txt```
 - Python 3.6.3
-- Pytorch version `0.4.0a0+cb4f6c3`
-  - CUDA (optional) 8.0
-- Ubuntu 16.04 operating system
 - PSIPRED libraries should be installed by downloading from [here](http://bioinfadmin.cs.ucl.ac.uk/downloads/psipred/) and following [this installation guide](http://bioinfadmin.cs.ucl.ac.uk/downloads/psipred/README)
 
 ## Demo Instructions
